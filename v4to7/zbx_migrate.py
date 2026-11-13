@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -91,6 +92,8 @@ SCOPE_TYPES = {0, 1, 13}  # условия «на что» действует: �
 ES_NAMES = {0: "триггеры", 1: "обнаружение", 2: "авторегистрация", 3: "внутренние"}
 IGNORE_ADDR = {"127.0.0.1", "0.0.0.0", "::1", "localhost"}
 STEPS = ("templates", "hosts", "existing", "hostgroups", "drules", "mediatypes", "actions")
+RETRY_ATTEMPTS = 4  # всего попыток для запросов на чтение (пауза 2, 4, 8 с)
+RETRY_METHODS = {"apiinfo.version", "user.login", "configuration.export", "configuration.importcompare"}
 PACKAGE_DIRS = ("templates", "hosts", "drules", "actions", "raw")
 SCRIPT_FIELDS = ("type", "command", "execute_on", "port", "authtype", "username",
                  "password", "publickey", "privatekey")
@@ -137,6 +140,10 @@ ADVICE = [
      "Прокси не найден в 7.2: создайте прокси 7.2 с тем же именем или задайте proxy_map/drop_missing_proxy, " + RERUN + "."),
     (r"[Tt]rigger expression|[Ii]ncorrect trigger|[Ii]nvalid expression|[Ii]ncorrect expression",
      "Выражение триггера не сконвертировалось: исправьте триггер в шаблоне/узле 4.4 (или в файле пакета) и повторите."),
+    (r"[Nn]o permissions to call|API access|[Aa]ccess to API",
+     "Роли пользователя API запрещён вызов этого метода: Пользователи → Роли пользователей → роль пользователя "
+     "токена → «Доступ к API» включён и список разрешённых методов не ограничивает нужные (в 8.0 доступ к API у "
+     "ролей по умолчанию выключен). Затем повторите запуск."),
     (r"[Nn]o permissions|[Nn]ot authori[sz]ed|[Pp]ermission denied|[Ss]ession terminated",
      "Недостаточно прав у пользователя API 7.2: используйте токен пользователя с типом «Супер-администратор»."),
     (r"[Aa]llowed memory size|memory",
@@ -193,12 +200,23 @@ class ZabbixAPI:
             body["auth"] = self.auth
         # apiinfo.version / user.login не принимают авторизацию; None убирает заголовок сессии
         hdrs = None if auth else {"Authorization": None}
-        try:
-            r = self.s.post(self.url, json=body, verify=self.verify, timeout=600, headers=hdrs)
-            r.raise_for_status()
-            data = r.json()
-        except (requests.RequestException, ValueError) as e:
-            raise ZabbixError(f"[{self.name}] {method}: ошибка HTTP/сети: {e}") from e
+        # чтение повторяем при сбое сети/5xx; запись — нет, чтобы не создать объект дважды
+        attempts = RETRY_ATTEMPTS if (method.endswith(".get") or method in RETRY_METHODS) else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                r = self.s.post(self.url, json=body, verify=self.verify, timeout=600, headers=hdrs)
+                r.raise_for_status()
+                data = r.json()
+                break
+            except (requests.RequestException, ValueError) as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                retryable = status is None or status >= 500 or status == 429
+                if attempt == attempts or not retryable:
+                    raise ZabbixError(f"[{self.name}] {method}: ошибка HTTP/сети: {e}") from e
+                delay = 2 ** attempt
+                log.warning("[%s] %s: сбой сети/HTTP (%s), повтор через %d с (попытка %d из %d)",
+                            self.name, method, e, delay, attempt + 1, attempts)
+                time.sleep(delay)
         if "error" in data:
             e = data["error"]
             raise ZabbixError(f"[{self.name}] {method}: {e.get('message')} {e.get('data')}")
@@ -442,8 +460,8 @@ class Preparer(Base):
             if not tgt or not self.dst_triggers(tgt, desc):
                 raise Unmappable(f"триггер '{desc}' из шаблона '{root}', который заменяется на "
                                  f"'{tgt or '—'}', а там такого триггера нет",
-                                 f"В новом шаблоне триггеры называются иначе: после apply создайте действие в 7.2 "
-                                 f"вручную, выбрав аналогичный триггер, или используйте условие по тегу/имени события.")
+                                 "В новом шаблоне триггеры называются иначе: после apply создайте действие в 7.2 "
+                                 "вручную, выбрав аналогичный триггер, или используйте условие по тегу/имени события.")
         return ref
 
     def dcheck_ref(self, dcheckid):
@@ -837,20 +855,34 @@ class Preparer(Base):
                 + (a.get("acknowledgeOperations") or []))
 
     @staticmethod
-    def convert_mediatype(m, name):
+    def convert_mediatype(m, name, passwd=None):
+        """Поля способа 4.4 -> 7.x/8.0. В 7.4+ поля проверяются строго по типу: поле, не относящееся
+        к типу/режиму (например username без аутентификации), должно быть пустым — иначе ошибка."""
         t = int(m["type"])
         b = {"name": name, "type": t, "status": m.get("status", "0")}
-        for k in ("maxsessions", "maxattempts", "attempt_interval"):
+        for k in ("maxattempts", "attempt_interval"):
             if k in m:
                 b[k] = m[k]
+        if t in (0, 1, 4) and "maxsessions" in m:  # у SMS maxsessions всегда 1 и не передаётся
+            b["maxsessions"] = m["maxsessions"]
         if m.get("name") and m.get("description"):
             b["description"] = m["description"]
         if t == 0:
-            for k in ("smtp_server", "smtp_helo", "smtp_email", "smtp_port", "smtp_security",
-                      "smtp_verify_peer", "smtp_verify_host", "smtp_authentication",
-                      "username", "passwd", "content_type"):
+            for k in ("smtp_server", "smtp_helo", "smtp_email", "smtp_port", "smtp_security"):
                 if m.get(k) not in (None, ""):
                     b[k] = m[k]
+            if str(m.get("smtp_security", "0")) in ("1", "2"):  # проверка сертификата — только с TLS/SSL
+                for k in ("smtp_verify_peer", "smtp_verify_host"):
+                    if m.get(k) not in (None, ""):
+                        b[k] = m[k]
+            if str(m.get("smtp_authentication", "0")) == "1":  # логин/пароль — только с аутентификацией
+                b["smtp_authentication"] = 1
+                b["username"] = m.get("username") or ""
+                b["passwd"] = passwd if passwd is not None else (m.get("passwd") or "")
+            # в 4.4 — content_type, в 7.0+ — message_format (content_type убран в 7.4)
+            fmt = m.get("message_format", m.get("content_type"))
+            if fmt not in (None, ""):
+                b["message_format"] = fmt
         elif t == 1:
             b["exec_path"] = m["exec_path"]
             params = (m.get("exec_params") or "").split("\n")
@@ -860,10 +892,13 @@ class Preparer(Base):
         elif t == 2:
             b["gsm_modem"] = m["gsm_modem"]
         elif t == 4:
-            for k in ("script", "timeout", "process_tags", "show_event_menu",
-                      "event_menu_url", "event_menu_name"):
+            for k in ("script", "timeout", "process_tags", "show_event_menu"):
                 if m.get(k) not in (None, ""):
                     b[k] = m[k]
+            if str(m.get("show_event_menu", "0")) == "1":  # URL и имя пункта меню — только если меню включено
+                for k in ("event_menu_url", "event_menu_name"):
+                    if m.get(k) not in (None, ""):
+                        b[k] = m[k]
             b["parameters"] = [{"name": p["name"], "value": p["value"]}
                                for p in m.get("parameters") or []]
         else:
@@ -898,18 +933,22 @@ class Preparer(Base):
                 mode, body = "reuse", None
                 res = f"подключить существующий в 7.2 '{target}' (не изменяется)"
             else:
+                # пароль SMTP: API 4.4 может его не отдать — тогда берём из конфига (по имени в 4.4 или в 7.2)
+                pw_cfg = self.cfg.get("media_type_passwords") or {}
+                passwd = pw_cfg.get(sname, pw_cfg.get(target))
                 try:
-                    body = self.convert_mediatype(m, target)
+                    body = self.convert_mediatype(m, target, passwd)
                 except (KeyError, ValueError) as e:
                     log.error("способ '%s': ошибка конвертации %r", sname, e)
                     body, err = None, e
                 mode = "create" if body else "unsupported"
                 if body:
                     res = "создать в 7.2"
-                    if str(m.get("smtp_authentication", "0")) == "1" and not m.get("passwd"):
-                        note = "пароль SMTP не получен из API 4.4"
-                        fix = (f"После apply задайте пароль в 7.2: Оповещения → Способы оповещения → '{target}' "
-                               f"(иначе письма не уйдут).")
+                    if body.get("smtp_authentication") == 1 and not body.get("passwd"):
+                        note = "пароль SMTP не получен из API 4.4 и не задан в конфиге"
+                        fix = (f"Укажите пароль в config.json: \"media_type_passwords\": {{\"{sname}\": \"...\"}} и "
+                               f"{RERUN}; или после apply задайте его в 7.2: Оповещения → Способы оповещения → "
+                               f"'{target}' (иначе письма не уйдут).")
                         self.problem(WARNING, "способ оповещения", target, note, fix)
                 else:
                     if err is not None:
@@ -1275,6 +1314,7 @@ class Applier(Base):
         self.m = load_json(self.path("manifest.json"))
         self.results = []
         self._warned_agent = False
+        self.progress = ""  # «[i/N] » в журнале для длинных шагов
 
     def res(self, typ, name, result, fix="", file="", level=None):
         """Записать итог; ошибки и непереносимое — ещё и в список проблем с рекомендацией."""
@@ -1285,7 +1325,7 @@ class Applier(Base):
             reason = result[len("ОШИБКА: "):] if result.startswith("ОШИБКА: ") else result
             self.problem(level or NOT_MIGRATED, typ, name, reason, fix)
         self.results.append({"тип": typ, "объект": name, "результат": result, "что сделать": fix})
-        (log.error if err else log.info)("%s '%s': %s", typ, name, result)
+        (log.error if err else log.info)("%s%s '%s': %s", self.progress, typ, name, result)
 
     def excluded(self, typ, name, item):
         """Объект исключён при подготовке (или вручную в manifest) — причина и что сделать из manifest."""
@@ -1293,19 +1333,25 @@ class Applier(Base):
         self.res(typ, name, f"не переносится: {reason}", item.get("fix") or "Если объект нужен — поставьте \"import\": true у него в manifest.json и повторите apply.", level=NOT_MIGRATED)
 
     def do_import(self, rel, rules):
-        if self.dry:
-            return None
+        """Импорт файла пакета. В --dry-run — configuration.importcompare: сервер проверяет и конвертирует
+        выгрузку 4.4 так же, как при импорте, но ничего не создаёт."""
+        method = "configuration.importcompare" if self.dry else "configuration.import"
         try:
-            self.dst.call("configuration.import", {"format": "json", "rules": rules,
-                                                   "source": json.dumps(load_json(self.path(rel)),
-                                                                        ensure_ascii=False)})
+            self.dst.call(method, {"format": "json", "rules": rules,
+                                   "source": json.dumps(load_json(self.path(rel)), ensure_ascii=False)})
             return None
         except ZabbixError as e:
+            # в --dry-run шаблоны из пакета ещё не созданы: ссылка на них — не ошибка
+            if self.dry and any(t["import"] and f'"{t["name"]}"' in str(e) for t in self.m["templates"]):
+                log.info("dry-run: %s ссылается на шаблон из этого же пакета — при apply он будет создан раньше", rel)
+                return None
             return str(e)
 
     def step_templates(self):
         exist = set(self.dst_ids("template"))
-        for t in self.m["templates"]:
+        total = len(self.m["templates"])
+        for i, t in enumerate(self.m["templates"], 1):
+            self.progress = f"[{i}/{total}] "
             if not t["import"]:
                 self.excluded("шаблон", t["name"], t)
             elif t["name"] in exist:
@@ -1313,13 +1359,16 @@ class Applier(Base):
             else:
                 err = self.do_import(t["file"], TEMPLATE_RULES)
                 self.res("шаблон", t["name"], f"ОШИБКА: {err}" if err else
-                         ("будет импортирован" if self.dry else "импортирован"), file=t["file"])
+                         ("проверен сервером, будет импортирован" if self.dry else "импортирован"), file=t["file"])
+        self.progress = ""
         self.drop_cache("template")
 
     def step_hosts(self):
         exist = set(self.dst_ids("host"))
         imported = []
-        for h in self.m["hosts"]:
+        total = len(self.m["hosts"])
+        for i, h in enumerate(self.m["hosts"], 1):
+            self.progress = f"[{i}/{total}] "
             if not h["import"]:
                 self.excluded("узел", h["host"], h)
             elif h["host"] in exist:
@@ -1327,15 +1376,16 @@ class Applier(Base):
             else:
                 err = self.do_import(h["file"], HOST_RULES)
                 self.res("узел", h["host"], f"ОШИБКА: {err}" if err else
-                         ("будет импортирован" if self.dry else "импортирован"), file=h["file"])
+                         ("проверен сервером, будет импортирован" if self.dry else "импортирован"), file=h["file"])
                 if not err:
                     imported.append(h["host"])
+        self.progress = ""
         self.drop_cache("host", "hostgroup")
         if imported and self.cfg.get("hosts_disabled") and not self.dry:
             ids = self.dst_ids("host")
             try:
-                self.dst.call("host.massupdate", {"hosts": [{"hostid": ids[n]} for n in imported if n in ids],
-                                                  "status": 1})
+                # host.update, а не host.massupdate: massupdate удалён в 8.0
+                self.dst.call("host.update", [{"hostid": ids[n], "status": 1} for n in imported if n in ids])
                 log.info("импортированные узлы деактивированы (hosts_disabled): %d", len(imported))
             except ZabbixError as e:
                 self.res("узлы", "деактивация импортированных", f"ОШИБКА: {e}",

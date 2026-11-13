@@ -1,0 +1,7 @@
+# рабочий конфиг с паролями/токенами
+config.json
+# пакеты prepare/apply: содержат пароли SMTP/SSH/SNMPv3 открытым текстом
+package/
+package*/
+*.log
+__pycache__/

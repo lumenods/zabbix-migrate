@@ -39,14 +39,16 @@ python3 zbx_migrate.py prepare -c config.json -p package
 # При необходимости поправьте флаги "import"/"apply" в package/manifest.json.
 
 # Этап 2: импорт в 7.2.
-python3 zbx_migrate.py apply -c config.json -p package --dry-run   # что будет сделано
+python3 zbx_migrate.py apply -c config.json -p package --dry-run   # проверка без изменений
 python3 zbx_migrate.py apply -c config.json -p package
 python3 zbx_migrate.py apply -c config.json -p package --steps hostgroups,drules,actions   # выборочно
 ```
 
 Перед каждым этапом скрипт показывает рекомендации отдельно для старого (4.4) и нового (7.2) сервера. Каждый блок нужно подтвердить ответом «да». Ключ `--yes` отключает вопросы для автоматического запуска.
 
-Повторный `apply` безопасен: уже созданное пропускается. Код возврата 1 означает, что при импорте были ошибки.
+`--dry-run` ничего не создаёт, но каждый шаблон и узел отправляет на проверку в `configuration.importcompare`: сервер 7.2 конвертирует выгрузку 4.4 так же, как при настоящем импорте, и сразу покажет ошибки конвертации.
+
+Повторный `apply` безопасен: уже созданное пропускается. Код возврата 1 означает, что при импорте были ошибки. Запросы на чтение при сбое сети или ответе 5xx повторяются до 4 раз с паузой; запросы на создание не повторяются, чтобы не создать объект дважды.
 
 ## Что сравнивается
 
@@ -78,6 +80,8 @@ python3 zbx_migrate.py apply -c config.json -p package --steps hostgroups,drules
 - `skip_duplicate_actions: true`: действие-дубль не создаётся.
 - `skip_drules_same_range: true`: правило с тем же диапазоном IP не создаётся. Действия подключаются к правилу 7.2.
 - `create_missing_groups: true`: группы узлов, которые нужны действиям, создаются пустыми.
+
+- `media_type_passwords: {}`: пароли SMTP для способов оповещения с аутентификацией, по имени способа в 4.4. API 4.4 может не отдать пароль; без этого параметра способ создастся с пустым паролем, и скрипт об этом предупредит.
 
 Остальные параметры описаны в `config.example.json`: фильтры `host_groups`, `hosts`, `actions` и `drules`, а также `proxy_map`, `drop_missing_proxy`, `hosts_disabled`, `include_user_media`, `migrate_all_templates`, `extra_templates`.
 

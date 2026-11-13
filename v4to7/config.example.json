@@ -36,6 +36,7 @@
   "media_type_map": {
     "Email": "Email"
   },
+  "media_type_passwords": {},
   "include_user_media": false,
 
   "create_missing_groups": true,
